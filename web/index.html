@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#101114">
+  <title>Sensai</title>
+  <link rel="stylesheet" href="/style.css">
+  <link rel="icon" type="image/x-icon" href="assets/favicon.ico">
+  <script defer src="/app.js"></script>
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar" id="sidebar">
+      <div class="brand-row">
+        <a class="brand" href="/" aria-label="Sensai home">
+          <span class="brand-mark">s</span><span>Sensai</span>
+        </a>
+        <button class="icon-btn sidebar-close" id="closeSidebar" title="Close sidebar" aria-label="Close sidebar">×</button>
+      </div>
+      <button class="new-chat-btn" id="newChat"><span class="plus">＋</span> New chat <kbd>⌘ K</kbd></button>
+      <div class="sidebar-label">YOUR CHATS</div>
+      <div class="conversation-list" id="conversationList" aria-live="polite">
+        <div class="sidebar-empty">Your conversations will appear here.</div>
+      </div>
+      <div class="sidebar-footer">
+        <button class="profile-shortcut" id="openProfile">
+          <span class="avatar">S</span>
+          <span class="profile-shortcut-copy"><strong>Personal profile</strong><small>Preferences & instructions</small></span>
+          <span class="chevron">›</span>
+        </button>
+        <div class="connection-status"><span class="status-dot" id="statusDot"></span><span id="statusText">Connecting to Ollama…</span></div>
+      </div>
+    </aside>
+
+    <main class="main-panel">
+      <header class="topbar">
+        <button class="icon-btn menu-btn" id="openSidebar" aria-label="Open sidebar" title="Open sidebar">☰</button>
+        <div class="topbar-title" id="topbarTitle">New conversation</div>
+        <div class="topbar-actions">
+          <label class="model-select-wrap" for="modelSelect"><span class="model-spark">✳</span>
+            <select id="modelSelect" aria-label="Model"><option value="">Loading models…</option></select>
+          </label>
+          <button class="icon-btn" id="headerProfile" title="Profile settings" aria-label="Profile settings">⚙</button>
+        </div>
+      </header>
+
+      <section class="chat-scroll" id="chatScroll">
+        <div class="welcome" id="welcome">
+          <div class="welcome-orb"><span>✳</span></div>
+          <p class="eyebrow">YOUR LOCAL AI COMPANION</p>
+          <h1>What’s on your mind?</h1>
+          <p class="welcome-subtitle">A little space to think, make, and figure things out.</p>
+          <div class="suggestions">
+            <button class="suggestion" data-prompt="Help me break down a big task into small, manageable steps."><span>↗</span><strong>Get unstuck</strong><small>Break a big task into steps</small></button>
+            <button class="suggestion" data-prompt="Help me brainstorm a few creative ideas for a project."><span>✧</span><strong>Brainstorm ideas</strong><small>Explore something new</small></button>
+            <button class="suggestion" data-prompt="Explain a tricky concept clearly, with a practical example."><span>⌘</span><strong>Learn something</strong><small>Make a hard topic click</small></button>
+            <button class="suggestion" data-prompt="Help me write or improve a piece of code. Ask me what I’m building first."><span>{ }</span><strong>Build something</strong><small>Think through code together</small></button>
+          </div>
+        </div>
+        <div class="messages" id="messages" aria-live="polite"></div>
+        <div class="stream-status hidden" id="streamStatus"><span class="typing-dots"><i></i><i></i><i></i></span><span id="streamStatusText">Thinking…</span></div>
+        <div id="scrollAnchor"></div>
+      </section>
+
+      <footer class="composer-area">
+        <div class="composer-wrap">
+          <div class="composer-tools">
+            <label class="think-toggle" title="Allow the model to show its thinking stream">
+              <input type="checkbox" id="thinkToggle"><span class="toggle-track"></span><span>Thinking</span>
+            </label>
+            <span class="composer-hint" id="composerHint">Local and private · Powered by Ollama</span>
+          </div>
+          <form class="composer" id="composerForm">
+            <textarea id="messageInput" rows="1" placeholder="Message Sensai…" aria-label="Message Sensai"></textarea>
+            <div class="composer-bottom">
+              <span class="input-hint">Enter to send · Shift + Enter for a new line</span>
+              <button class="send-btn" id="sendBtn" type="submit" aria-label="Send message" title="Send message"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5M6 11l6-6 6 6"/></svg></button>
+              <button class="send-btn stop-btn hidden" id="stopBtn" type="button" aria-label="Stop generation" title="Stop generation"><span></span></button>
+            </div>
+          </form>
+          <div class="footer-note">Sensai can make mistakes. Check important information.</div>
+        </div>
+      </footer>
+    </main>
+  </div>
+
+  <div class="toast-region" id="toastRegion" aria-live="polite"></div>
+
+  <dialog class="modal" id="profileModal">
+    <form method="dialog" class="modal-card" id="profileForm">
+      <div class="modal-header"><div><p class="eyebrow">MAKE IT YOURS</p><h2>Profile & preferences</h2></div><button class="icon-btn" value="cancel" aria-label="Close profile">×</button></div>
+      <p class="modal-intro">These details are saved locally by your Sensai server and can guide future replies.</p>
+      <label class="field-label" for="profileName">Name <span>optional</span></label>
+      <input class="text-field" id="profileName" maxlength="100" placeholder="What should Sensai call you?">
+      <label class="field-label" for="profilePreferences">Preferences <span>one per line</span></label>
+      <textarea class="text-field field-textarea" id="profilePreferences" rows="4" placeholder="Prefer concise answers&#10;Use Python examples when useful"></textarea>
+      <label class="field-label" for="profileInstructions">Custom instructions</label>
+      <textarea class="text-field field-textarea" id="profileInstructions" rows="4" placeholder="Anything Sensai should keep in mind…"></textarea>
+      <div class="modal-actions"><span class="save-status" id="profileSaveStatus"></span><button type="button" class="secondary-btn" id="cancelProfile">Cancel</button><button type="submit" class="primary-btn" id="saveProfile">Save profile</button></div>
+    </form>
+  </dialog>
+
+  <dialog class="modal confirm-modal" id="confirmModal">
+    <form method="dialog" class="modal-card">
+      <div class="modal-header"><h2 id="confirmTitle">Delete conversation?</h2><button class="icon-btn" value="cancel" aria-label="Close">×</button></div>
+      <p class="modal-intro" id="confirmText">This action cannot be undone.</p>
+      <div class="modal-actions"><button class="secondary-btn" value="cancel">Cancel</button><button class="danger-btn" id="confirmDelete" value="default">Delete</button></div>
+    </form>
+  </dialog>
+</body>
+</html>

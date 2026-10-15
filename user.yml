@@ -1,0 +1,8 @@
+name: Pitou
+preferences:
+  - Answer concisely
+  - Prefer code examples
+  - Rust language
+instructions: |
+  I am a student working on code projects.
+  I use Linux and VS Code.
