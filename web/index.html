@@ -6,8 +6,9 @@
   <meta name="theme-color" content="#101114">
   <title>Sensai</title>
   <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/extras.css">
   <link rel="icon" type="image/x-icon" href="assets/favicon.ico">
-  <script defer src="/app.js"></script>
+  <script type="module" src="/js/main.js"></script>
 </head>
 <body>
   <div class="app-shell">
@@ -38,6 +39,7 @@
         <button class="icon-btn menu-btn" id="openSidebar" aria-label="Open sidebar" title="Open sidebar">☰</button>
         <div class="topbar-title" id="topbarTitle">New conversation</div>
         <div class="topbar-actions">
+          <div class="context-meter" id="contextMeter" title="Context window usage"><span class="context-label">Context</span><span id="contextText">0 / 8k</span><div class="context-bar"><i id="contextFill"></i></div></div>
           <label class="model-select-wrap" for="modelSelect"><span class="model-spark">✳</span>
             <select id="modelSelect" aria-label="Model"><option value="">Loading models…</option></select>
           </label>
@@ -60,7 +62,6 @@
         </div>
         <div class="messages" id="messages" aria-live="polite"></div>
         <div class="stream-status hidden" id="streamStatus"><span class="typing-dots"><i></i><i></i><i></i></span><span id="streamStatusText">Thinking…</span></div>
-        <div id="scrollAnchor"></div>
       </section>
 
       <footer class="composer-area">
@@ -72,7 +73,7 @@
             <span class="composer-hint" id="composerHint">Local and private · Powered by Ollama</span>
           </div>
           <form class="composer" id="composerForm">
-            <textarea id="messageInput" rows="1" placeholder="Message Sensai…" aria-label="Message Sensai"></textarea>
+            <textarea id="messageInput" rows="1" placeholder="Message Sensai…  (type / for your saved prompts)" aria-label="Message Sensai"></textarea>
             <div class="composer-bottom">
               <span class="input-hint">Enter to send · Shift + Enter for a new line</span>
               <button class="send-btn" id="sendBtn" type="submit" aria-label="Send message" title="Send message"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5M6 11l6-6 6 6"/></svg></button>
@@ -90,7 +91,7 @@
   <dialog class="modal" id="profileModal">
     <form method="dialog" class="modal-card" id="profileForm">
       <div class="modal-header"><div><p class="eyebrow">MAKE IT YOURS</p><h2>Profile & preferences</h2></div><button class="icon-btn" value="cancel" aria-label="Close profile">×</button></div>
-      <p class="modal-intro">These details are saved locally by your Sensai server and can guide future replies.</p>
+      <p class="modal-intro">These details are saved locally by your Sensai server and guide every reply.</p>
       <label class="field-label" for="profileName">Name <span>optional</span></label>
       <input class="text-field" id="profileName" maxlength="100" placeholder="What should Sensai call you?">
       <label class="field-label" for="profilePreferences">Preferences <span>one per line</span></label>

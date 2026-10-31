@@ -1,7 +1,10 @@
 import sqlite3
 import threading
 from datetime import datetime, timezone
+import json
 from typing import Optional
+
+from .budget import estimate_tokens
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS conversations (
@@ -29,6 +32,21 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 CREATE INDEX IF NOT EXISTS idx_messages_parent ON messages(parent_id);
 CREATE INDEX IF NOT EXISTS idx_messages_conv   ON messages(conversation_id);
+CREATE TABLE IF NOT EXISTS summaries (        -- M2: condensed older messages
+    id              INTEGER PRIMARY KEY,
+    conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    upto_message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    content         TEXT NOT NULL,
+    source_tokens   INTEGER,
+    created_at      TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS prompts (          -- saved prompt library
+    id         INTEGER PRIMARY KEY,
+    title      TEXT NOT NULL,
+    content    TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS facts (            -- reserved for M3
     id                INTEGER PRIMARY KEY,
     key               TEXT NOT NULL,
@@ -37,6 +55,13 @@ CREATE TABLE IF NOT EXISTS facts (            -- reserved for M3
     updated_at        TEXT NOT NULL
 );
 """
+
+DEFAULT_PROMPTS = [
+    ("Get unstuck", "Help me break down a big task into small, manageable steps."),
+    ("Brainstorm ideas", "Help me brainstorm a few creative ideas for a project."),
+    ("Learn something", "Explain a tricky concept clearly, with a practical example."),
+    ("Build something", "Help me write or improve a piece of code. Ask me what I\u2019m building first."),
+]
 
 
 def _now() -> str:
@@ -61,7 +86,14 @@ class Storage:
             conn.execute("PRAGMA foreign_keys = ON")
             if self._path != ":memory:":
                 conn.execute("PRAGMA journal_mode = WAL")
+            fresh = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                                 "AND name='prompts'").fetchone() is None
             conn.executescript(SCHEMA)
+            if fresh:
+                conn.executemany(
+                    "INSERT INTO prompts(title, content, created_at) VALUES (?,?,?)",
+                    [(t, c, _now()) for t, c in DEFAULT_PROMPTS])
+                conn.commit()
             self._local.conn = conn
         return conn
 
@@ -162,11 +194,53 @@ class Storage:
         return [dict(r) for r in rows]
 
     def build_context(self, conv_id: int, system_prompt: str) -> list[dict]:
-        """The list you send to Ollama: system prompt + active path."""
-        msgs = [{"role": "system", "content": system_prompt}]
-        msgs += [{"role": m["role"], "content": m["content"]}
-                 for m in self.get_path(conv_id) if m["role"] != "system"]
-        return msgs
+        """What is sent to Ollama: system prompt (+ summary of condensed turns) + the
+        messages after the summary's cut-off, along the active path."""
+        path = self.get_path(conv_id)
+        summ = self.active_summary(conv_id, path)
+        if summ:
+            system_prompt += ("\n\nSummary of the earlier conversation (older messages were "
+                              "condensed to save context):\n" + summ["content"])
+            cut = next(i for i, m in enumerate(path) if m["id"] == summ["upto_message_id"])
+            path = path[cut + 1:]
+        return [{"role": "system", "content": system_prompt}] + [
+            {"role": m["role"], "content": m["content"]} for m in path if m["role"] != "system"]
+
+    def add_summary(self, conv_id: int, upto_message_id: int, content: str,
+                    source_tokens: int) -> int:
+        cur = self.db.execute(
+            "INSERT INTO summaries(conversation_id, upto_message_id, content, source_tokens, "
+            "created_at) VALUES (?,?,?,?,?)",
+            (conv_id, upto_message_id, content, source_tokens, _now()))
+        self.db.commit()
+        return cur.lastrowid
+
+    def active_summary(self, conv_id: int, path: Optional[list] = None) -> Optional[dict]:
+        """The summary covering the deepest point of the current branch (None if none).
+        Summaries hang on a message id, so other branches never see them."""
+        path = self.get_path(conv_id) if path is None else path
+        pos = {m["id"]: i for i, m in enumerate(path)}
+        rows = [dict(r) for r in self.db.execute(
+            "SELECT * FROM summaries WHERE conversation_id=?", (conv_id,))]
+        rows = [r for r in rows if r["upto_message_id"] in pos]
+        return max(rows, key=lambda r: pos[r["upto_message_id"]], default=None)
+
+    def summary_info(self, conv_id: int) -> Optional[dict]:
+        path = self.get_path(conv_id)
+        summ = self.active_summary(conv_id, path)
+        if not summ:
+            return None
+        cut = next(i for i, m in enumerate(path) if m["id"] == summ["upto_message_id"])
+        return {"messages_condensed": cut + 1, "summary_tokens": estimate_tokens(summ["content"]),
+                "source_tokens": summ["source_tokens"]}
+
+    def all_settings(self) -> dict:
+        return {r["key"]: json.loads(r["value"]) for r in self.db.execute("SELECT * FROM settings")}
+
+    def set_setting(self, key: str, value) -> None:
+        self.db.execute("INSERT INTO settings(key, value) VALUES (?,?) "
+                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, json.dumps(value)))
+        self.db.commit()
 
     def discard_message(self, msg_id: int, restore_leaf_id: Optional[int]) -> None:
         """Remove a leaf message (used to roll back a turn that failed) and
@@ -180,6 +254,32 @@ class Storage:
         self.db.execute("UPDATE conversations SET active_leaf_id=?, updated_at=? WHERE id=?",
                         (restore_leaf_id, _now(), msg["conversation_id"]))
         self.db.commit()
+
+    def fork_conversation(self, conv_id: int, from_message_id: Optional[int] = None,
+                          title: Optional[str] = None) -> int:
+        """Copy a conversation's displayed path (up to from_message_id if given) into a
+        NEW independent conversation. The original is never touched."""
+        conv = self.get_conversation(conv_id)
+        if conv is None:
+            raise KeyError(f"Conversation {conv_id} not found")
+        if from_message_id is None:
+            path = self.get_path(conv_id)
+        else:
+            msg = self.get_message(from_message_id)
+            if msg is None or msg["conversation_id"] != conv_id:
+                raise ValueError("from_message_id does not belong to this conversation")
+            path = self.get_path(conv_id, leaf_id=from_message_id)
+        if not path:
+            raise ValueError("Nothing to fork: the conversation is empty")
+        new_id = self.create_conversation(title or f"{conv['title']} (fork)"[:100],
+                                          conv["persona"], conv["model"])
+        parent = None
+        for m in path:
+            parent = self.add_message(
+                new_id, m["role"], m["content"], parent_id=parent, thinking=m["thinking"],
+                prompt_tokens=m["prompt_tokens"], gen_tokens=m["gen_tokens"],
+                duration_s=m["duration_s"], interrupted=bool(m["interrupted"]))
+        return new_id
 
     def get_siblings(self, msg_id: int) -> list[dict]:
         """All messages sharing this message's parent (including itself), oldest first."""
@@ -225,6 +325,28 @@ class Storage:
         self.db.execute("UPDATE conversations SET active_leaf_id=?, updated_at=? WHERE id=?",
                         (self._latest_leaf(msg_id), _now(), msg["conversation_id"]))
         self.db.commit()
+
+    def list_prompts(self) -> list[dict]:
+        return [dict(r) for r in self.db.execute("SELECT * FROM prompts ORDER BY id")]
+
+    def create_prompt(self, title: str, content: str) -> dict:
+        cur = self.db.execute("INSERT INTO prompts(title, content, created_at) VALUES (?,?,?)",
+                              (title, content, _now()))
+        self.db.commit()
+        return dict(self.db.execute("SELECT * FROM prompts WHERE id=?", (cur.lastrowid,)).fetchone())
+
+    def update_prompt(self, prompt_id: int, title: str, content: str) -> Optional[dict]:
+        cur = self.db.execute("UPDATE prompts SET title=?, content=? WHERE id=?",
+                              (title, content, prompt_id))
+        self.db.commit()
+        if cur.rowcount == 0:
+            return None
+        return dict(self.db.execute("SELECT * FROM prompts WHERE id=?", (prompt_id,)).fetchone())
+
+    def delete_prompt(self, prompt_id: int) -> bool:
+        cur = self.db.execute("DELETE FROM prompts WHERE id=?", (prompt_id,))
+        self.db.commit()
+        return cur.rowcount > 0
 
     def token_usage(self, conv_id: int) -> dict:
         """Totals over the ACTIVE path (what the model actually sees)."""

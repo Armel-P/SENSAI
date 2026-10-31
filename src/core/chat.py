@@ -1,15 +1,30 @@
 from dataclasses import dataclass
 from typing import Callable, Iterator, Optional, Union
 
+from .budget import (effective_budget, estimate_tokens, resolve_settings,
+                     validate_settings)
 from .ollama_client import Done, OllamaError, Thinking, Token, stream_chat
 from .profile import load_profile, profile_to_prompt
 from .storage import Storage
 
 DEFAULT_TITLE = "New conversation"
 
+SUMMARY_SYSTEM = (
+    "You condense conversations. Merge the previous summary (if any) with the new excerpt into "
+    "ONE compact summary of at most {words} words. Keep: facts about the user, names, numbers, "
+    "decisions, constraints, code identifiers, file names and open questions. Drop pleasantries "
+    "and repetition. Reply with the summary only, as plain text.")
+
+
 @dataclass
 class Started:
     user_message_id: int
+
+@dataclass
+class Compressed:
+    messages: int
+    source_tokens: int
+    summary_tokens: int
 
 @dataclass
 class Finished:
@@ -18,7 +33,7 @@ class Finished:
     gen_tokens: int
     duration_s: float
 
-Event = Union[Started, Thinking, Token, Finished]
+Event = Union[Started, Compressed, Thinking, Token, Finished]
 
 
 class ChatService:
@@ -27,10 +42,82 @@ class ChatService:
         self.cfg = cfg
         self.stream_fn = stream_fn
 
+    def settings(self) -> dict:
+        s = resolve_settings(self.cfg, self.storage.all_settings())
+        s["effective_budget"] = effective_budget(s)
+        return s
+
+    def update_settings(self, patch: dict) -> dict:
+        for key, value in validate_settings(patch).items():
+            self.storage.set_setting(key, value)
+        return self.settings()
+
     def system_prompt(self) -> str:
         extra = profile_to_prompt(load_profile(self.cfg["profile_path"]))
         base = self.cfg["system_prompt"]
         return f"{base}\n\n{extra}" if extra else base
+
+    def _maybe_compress(self, conv_id: int, model: str, st: dict) -> Optional[Compressed]:
+        cap = st["effective_budget"]
+        if not cap:
+            return None
+        path = self.storage.get_path(conv_id)
+        summ = self.storage.active_summary(conv_id, path)
+        start = 0
+        if summ:
+            start = next(i for i, m in enumerate(path) if m["id"] == summ["upto_message_id"]) + 1
+        pending = path[start:]
+        prev = summ["content"] if summ else ""
+
+        tokens = (estimate_tokens(self.system_prompt() + prev)
+                  + sum(estimate_tokens(m["content"]) for m in pending))
+
+        last = next((m for m in reversed(path) if m["prompt_tokens"]), None)
+        if last and (not summ or last["id"] > summ["upto_message_id"]):
+            after = path[path.index(last) + 1:]
+            tokens = max(tokens, last["prompt_tokens"] + (last["gen_tokens"] or 0)
+                         + sum(estimate_tokens(m["content"]) for m in after))
+        if tokens <= cap:
+            return None
+
+        old = pending[:-st["keep_recent"]] if len(pending) > st["keep_recent"] else []
+        while old and old[-1]["role"] != "assistant":     # cut on a complete exchange
+            old.pop()
+        if not old:
+            return None
+        try:
+            text = self._summarize(model, prev, old, st, cap)
+        except OllamaError:
+            return None
+        if not text:
+            return None
+        source = sum(estimate_tokens(m["content"]) for m in old) + estimate_tokens(prev)
+        self.storage.add_summary(conv_id, old[-1]["id"], text, source)
+        return Compressed(len(old), source, estimate_tokens(text))
+
+    def _summarize(self, model: str, previous: str, msgs: list, st: dict, cap: int) -> str:
+        system = SUMMARY_SYSTEM.format(words=max(80, cap // 8))
+        limit = max(500, st["num_ctx"] // 2)              # excerpt size per call (rolling fold)
+
+        def run(chunk, summary):
+            transcript = "\n".join(f"{m['role'].upper()}: {m['content']}" for m in chunk)
+            user = (f"Previous summary:\n{summary}\n\n" if summary else "") + f"New excerpt:\n{transcript}"
+            events = self.stream_fn(self.cfg["ollama_url"], model,
+                                    [{"role": "system", "content": system},
+                                     {"role": "user", "content": user}],
+                                    st["num_ctx"], think=False)
+            return "".join(e.text for e in events if isinstance(e, Token)).strip()
+
+        summary, chunk, size = previous, [], 0
+        for m in msgs:
+            t = estimate_tokens(m["content"])
+            if chunk and size + t > limit:
+                summary, chunk, size = run(chunk, summary), [], 0
+                if not summary:
+                    return ""
+            chunk.append(m)
+            size += t
+        return run(chunk, summary) if chunk else summary
 
     def send(self, conv_id: int, content: str, *, edit_message_id: Optional[int] = None,
              model: Optional[str] = None, think: Optional[bool] = None) -> Iterator[Event]:
@@ -57,14 +144,18 @@ class ChatService:
         if updates:
             self.storage.update_conversation(conv_id, **updates)
 
+        st = self.settings()
         text: list[str] = []
         thought: list[str] = []
         stats: Optional[Done] = None
         try:
             yield Started(user_id)
+            compressed = self._maybe_compress(conv_id, model, st)
+            if compressed:
+                yield compressed
             context = self.storage.build_context(conv_id, self.system_prompt())
             for ev in self.stream_fn(self.cfg["ollama_url"], model, context,
-                                     self.cfg["num_ctx"], think=think):
+                                     st["num_ctx"], think=think):
                 if isinstance(ev, Token):
                     text.append(ev.text)
                     yield ev
@@ -74,7 +165,6 @@ class ChatService:
                 elif isinstance(ev, Done):
                     stats = ev
         except (GeneratorExit, OllamaError):
-            # Interrupt or failure: keep what we got, or roll the turn back if nothing.
             if text:
                 self.storage.add_message(conv_id, "assistant", "".join(text),
                                          thinking="".join(thought) or None, interrupted=True)

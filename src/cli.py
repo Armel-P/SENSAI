@@ -1,13 +1,13 @@
 import argparse
 import sys
 
-from src.core.chat import ChatService, Finished, Started
+from src.core.chat import ChatService, Compressed, Finished, Started
 from src.core.config import load_config
 from src.core.ollama_client import OllamaError, Thinking, Token
 from src.core.storage import Storage
 
 DIM, RESET = "\033[2m", "\033[0m"
-HELP = ("Commands: /list  /new  /resume <id>  /history  /title <text>  /help  /quit")
+HELP = ("Commands: /list  /new  /resume <id>  /history  /title <text>  /budget [n|off]  /ctx [n]  /help  /quit")
 
 
 def show_history(storage, conv_id):
@@ -76,6 +76,16 @@ def main() -> int:
                     print("Usage: /resume <id>  (see /list)")
             elif cmd == "/history":
                 show_history(storage, conv_id)
+            elif cmd in ("/budget", "/ctx"):
+                if arg.strip():
+                    value = 0 if arg.strip() == "off" else arg.strip()
+                    try:
+                        chat.update_settings({"token_budget" if cmd == "/budget" else "num_ctx": int(value)})
+                    except ValueError as e:
+                        print(f"[error] {e}")
+                s = chat.settings()
+                print(f"window {s['num_ctx']} tokens | budget {s['effective_budget'] or 'off'} | "
+                      f"keep {s['keep_recent']} newest messages")
             elif cmd == "/title":
                 if arg.strip() and conv_id is not None:
                     storage.update_conversation(conv_id, title=arg.strip())
@@ -97,6 +107,9 @@ def main() -> int:
                         print("\n", end="")
                         was_thinking = False
                     print(ev.text, end="", flush=True)
+                elif isinstance(ev, Compressed):
+                    print(f"\n[condensed {ev.messages} older messages: ~{ev.source_tokens} -> "
+                          f"{ev.summary_tokens} tokens]\nsensai> ", end="", flush=True)
                 elif isinstance(ev, Finished):
                     print(f"\n[{ev.prompt_tokens} prompt + {ev.gen_tokens} gen tokens, "
                           f"{ev.duration_s:.1f}s]")
