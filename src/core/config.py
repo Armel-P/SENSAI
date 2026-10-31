@@ -7,7 +7,7 @@ DEFAULTS = {
     "num_ctx": 8192,
     "system_prompt": "You are a helpful assistant.",
     "db_path": "sensai.db",
-    "profile_path": "profiles/user.yaml",
+    "profile_path": "profiles/user.yml",
     "host": "127.0.0.1",
     "port": 8000
 }

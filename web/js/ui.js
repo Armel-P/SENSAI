@@ -23,11 +23,24 @@ export function setConnection(ok, message) {
   els.statusText.textContent = message;
 }
 
+function syncComposer() {
+  const locked = state.isStreaming || Boolean(state.pendingInteraction);
+  els.sendBtn.classList.toggle("hidden", state.isStreaming);
+  els.stopBtn.classList.toggle("hidden", !state.isStreaming);
+  for (const control of [els.messageInput, els.modelSelect, els.thinkToggle, els.sendBtn]) control.disabled = locked;
+  els.composerHint.textContent = state.pendingInteraction
+    ? "Sensai is waiting for your response above"
+    : "Local and private · Powered by Ollama";
+  els.streamStatus.classList.toggle("hidden", !state.isStreaming);
+  if (!state.isStreaming) els.streamStatusText.textContent = "Thinking…";
+}
+
 export function setStreaming(active) {
   state.isStreaming = active;
-  els.sendBtn.classList.toggle("hidden", active);
-  els.stopBtn.classList.toggle("hidden", !active);
-  for (const control of [els.messageInput, els.modelSelect, els.thinkToggle]) control.disabled = active;
-  els.streamStatus.classList.toggle("hidden", !active);
-  if (!active) els.streamStatusText.textContent = "Thinking…";
+  syncComposer();
+}
+
+export function setPendingInteraction(interaction) {
+  state.pendingInteraction = interaction;
+  syncComposer();
 }

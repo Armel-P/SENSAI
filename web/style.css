@@ -104,6 +104,14 @@ kbd { margin-left: auto; font-size: 10px; color: var(--faint); border: 1px solid
 .message-actions { display: flex; align-items: center; gap: 5px; margin-top: 10px; opacity: .75; }
 .message-actions button { border: 1px solid transparent; border-radius: 6px; background: transparent; padding: 5px 7px; color: var(--faint); font-size: 10px; }
 .message-actions button:hover { background: #22232a; border-color: #33343d; color: #d8d7e0; }
+.interaction-message .message-avatar { background: #373143; }
+.interaction-question { margin: 0 0 12px; color: #e5e3ec; font-size: 13px; line-height: 1.65; }
+.interaction-description { margin: 0 0 12px; color: var(--muted); font-size: 11.5px; line-height: 1.6; }
+.interaction-form { display: flex; flex-wrap: wrap; gap: 7px; }
+.interaction-option { padding: 7px 10px; font-size: 11px; }
+.interaction-answer { flex: 1 0 100%; min-height: 68px; resize: vertical; line-height: 1.5; }
+.interaction-actions { display: flex; justify-content: flex-end; gap: 7px; flex: 1 0 100%; }
+.interaction-actions .primary-btn, .interaction-actions .secondary-btn { padding: 8px 12px; }
 .branch-indicator { color: var(--faint); font-size: 10px; margin: 0 4px; }
 .inline-edit { width: 100%; min-height: 100px; resize: vertical; border: 1px solid #4a435e; border-radius: 9px; background: #19191f; padding: 10px; color: var(--text); line-height: 1.6; }
 .edit-actions { display: flex; justify-content: flex-end; gap: 7px; margin-top: 8px; }

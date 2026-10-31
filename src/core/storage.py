@@ -1,3 +1,8 @@
+"""SQLite storage. Messages form a tree (parent_id) so a conversation can branch.
+
+A conversation always displays ONE path: root -> active_leaf_id.
+Editing a past message = new sibling + move the active leaf. Nothing is copied or deleted.
+"""
 import sqlite3
 import threading
 from datetime import datetime, timezone
@@ -28,10 +33,19 @@ CREATE TABLE IF NOT EXISTS messages (
     gen_tokens      INTEGER,
     duration_s      REAL,
     interrupted     INTEGER NOT NULL DEFAULT 0,
+    tool_trace      TEXT,              -- JSON: tool calls made while producing this reply
     created_at      TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_messages_parent ON messages(parent_id);
 CREATE INDEX IF NOT EXISTS idx_messages_conv   ON messages(conversation_id);
+CREATE TABLE IF NOT EXISTS pending_turns (     -- turns suspended for A3 / X4 (survive a restart)
+    id              INTEGER PRIMARY KEY,
+    conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    user_message_id INTEGER NOT NULL,
+    state           TEXT NOT NULL,
+    interaction     TEXT NOT NULL,
+    created_at      TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS summaries (        -- M2: condensed older messages
     id              INTEGER PRIMARY KEY,
     conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
@@ -64,18 +78,23 @@ DEFAULT_PROMPTS = [
 ]
 
 
+def _msg(row) -> dict:
+    """Message row -> dict, with tool_trace decoded from JSON."""
+    d = dict(row)
+    if d.get("tool_trace"):
+        d["tool_trace"] = json.loads(d["tool_trace"])
+    return d
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="microseconds")
 
 
 class Storage:
     def __init__(self, path: str = "sensai.db"):
-        # One SQLite connection per thread (FastAPI runs handlers in a thread pool).
-        # NB: with ":memory:" each thread would get its own empty DB -> use a file
-        # when several threads are involved.
         self._path = path
         self._local = threading.local()
-        self.db  # create the schema right away
+        self.db
 
     @property
     def db(self) -> sqlite3.Connection:
@@ -89,6 +108,9 @@ class Storage:
             fresh = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
                                  "AND name='prompts'").fetchone() is None
             conn.executescript(SCHEMA)
+            if "tool_trace" not in {r[1] for r in conn.execute("PRAGMA table_info(messages)")}:
+                conn.execute("ALTER TABLE messages ADD COLUMN tool_trace TEXT")
+                conn.commit()
             if fresh:
                 conn.executemany(
                     "INSERT INTO prompts(title, content, created_at) VALUES (?,?,?)",
@@ -143,12 +165,13 @@ class Storage:
 
     def get_message(self, msg_id: int) -> Optional[dict]:
         row = self.db.execute("SELECT * FROM messages WHERE id=?", (msg_id,)).fetchone()
-        return dict(row) if row else None
+        return _msg(row) if row else None
 
     def add_message(self, conv_id: int, role: str, content: str, *,
                     parent_id: Optional[int] = ..., thinking: Optional[str] = None,
                     prompt_tokens: Optional[int] = None, gen_tokens: Optional[int] = None,
-                    duration_s: Optional[float] = None, interrupted: bool = False) -> int:
+                    duration_s: Optional[float] = None, interrupted: bool = False,
+                    tool_trace: Optional[list] = None) -> int:
         """Add a message and make it the active leaf.
         parent_id defaults to the current active leaf (normal chat flow)."""
         conv = self.get_conversation(conv_id)
@@ -163,10 +186,10 @@ class Storage:
         now = _now()
         cur = self.db.execute(
             "INSERT INTO messages(conversation_id, parent_id, role, content, thinking, "
-            "prompt_tokens, gen_tokens, duration_s, interrupted, created_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            "prompt_tokens, gen_tokens, duration_s, interrupted, tool_trace, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             (conv_id, parent_id, role, content, thinking, prompt_tokens, gen_tokens,
-             duration_s, int(interrupted), now))
+             duration_s, int(interrupted), json.dumps(tool_trace) if tool_trace else None, now))
         msg_id = cur.lastrowid
         self.db.execute("UPDATE conversations SET active_leaf_id=?, updated_at=? WHERE id=?",
                         (msg_id, now, conv_id))
@@ -191,7 +214,7 @@ class Storage:
             SELECT m.* FROM path p JOIN messages m ON m.id = p.id
             ORDER BY p.depth DESC
         """, (leaf_id, conv_id)).fetchall()
-        return [dict(r) for r in rows]
+        return [_msg(r) for r in rows]
 
     def build_context(self, conv_id: int, system_prompt: str) -> list[dict]:
         """What is sent to Ollama: system prompt (+ summary of condensed turns) + the
@@ -203,8 +226,50 @@ class Storage:
                               "condensed to save context):\n" + summ["content"])
             cut = next(i for i, m in enumerate(path) if m["id"] == summ["upto_message_id"])
             path = path[cut + 1:]
-        return [{"role": "system", "content": system_prompt}] + [
-            {"role": m["role"], "content": m["content"]} for m in path if m["role"] != "system"]
+        out = [{"role": "system", "content": system_prompt}]
+        for m in path:
+            if m["role"] == "system":
+                continue
+            for step in m.get("tool_trace") or []:
+                calls = step.get("calls", [])
+                out.append({"role": "assistant", "content": step.get("content") or "",
+                            "tool_calls": [{"function": {"name": c["name"], "arguments": c["arguments"]}}
+                                           for c in calls]})
+                out += [{"role": "tool", "tool_name": c["name"],
+                         "content": c["result"] if c.get("result") is not None else "(no result: interrupted)"}
+                        for c in calls]
+            if m["content"] or not m.get("tool_trace"):
+                out.append({"role": m["role"], "content": m["content"]})
+        return out
+
+    def save_pending(self, conv_id: int, user_message_id: int, state: dict, interaction: dict) -> int:
+        cur = self.db.execute(
+            "INSERT INTO pending_turns(conversation_id, user_message_id, state, interaction, created_at) "
+            "VALUES (?,?,?,?,?)", (conv_id, user_message_id, json.dumps(state), json.dumps(interaction), _now()))
+        self.db.commit()
+        return cur.lastrowid
+
+    @staticmethod
+    def _pending(row) -> Optional[dict]:
+        if row is None:
+            return None
+        return {"id": row["id"], "conversation_id": row["conversation_id"],
+                "state": json.loads(row["state"]), "interaction": json.loads(row["interaction"])}
+
+    def get_pending(self, pending_id: int) -> Optional[dict]:
+        return self._pending(self.db.execute("SELECT * FROM pending_turns WHERE id=?", (pending_id,)).fetchone())
+
+    def take_pending(self, pending_id: int) -> Optional[dict]:
+        """Read AND delete (a suspended turn is resumed at most once)."""
+        pending = self.get_pending(pending_id)
+        if pending:
+            self.db.execute("DELETE FROM pending_turns WHERE id=?", (pending_id,))
+            self.db.commit()
+        return pending
+
+    def pending_for(self, conv_id: int) -> list[dict]:
+        return [self._pending(r) for r in self.db.execute(
+            "SELECT * FROM pending_turns WHERE conversation_id=? ORDER BY id", (conv_id,))]
 
     def add_summary(self, conv_id: int, upto_message_id: int, content: str,
                     source_tokens: int) -> int:
@@ -233,6 +298,15 @@ class Storage:
         cut = next(i for i, m in enumerate(path) if m["id"] == summ["upto_message_id"])
         return {"messages_condensed": cut + 1, "summary_tokens": estimate_tokens(summ["content"]),
                 "source_tokens": summ["source_tokens"]}
+
+    def list_messages(self, conv_id: int) -> list[dict]:
+        """Every message of the conversation (all branches), oldest first."""
+        return [_msg(r) for r in self.db.execute(
+            "SELECT * FROM messages WHERE conversation_id=? ORDER BY id", (conv_id,))]
+
+    def list_summaries(self, conv_id: int) -> list[dict]:
+        return [dict(r) for r in self.db.execute(
+            "SELECT * FROM summaries WHERE conversation_id=? ORDER BY id", (conv_id,))]
 
     def all_settings(self) -> dict:
         return {r["key"]: json.loads(r["value"]) for r in self.db.execute("SELECT * FROM settings")}
@@ -278,7 +352,8 @@ class Storage:
             parent = self.add_message(
                 new_id, m["role"], m["content"], parent_id=parent, thinking=m["thinking"],
                 prompt_tokens=m["prompt_tokens"], gen_tokens=m["gen_tokens"],
-                duration_s=m["duration_s"], interrupted=bool(m["interrupted"]))
+                duration_s=m["duration_s"], interrupted=bool(m["interrupted"]),
+                tool_trace=m.get("tool_trace"))
         return new_id
 
     def get_siblings(self, msg_id: int) -> list[dict]:
@@ -289,7 +364,7 @@ class Storage:
         rows = self.db.execute(
             "SELECT * FROM messages WHERE conversation_id=? AND parent_id IS ? ORDER BY id",
             (msg["conversation_id"], msg["parent_id"])).fetchall()
-        return [dict(r) for r in rows]
+        return [_msg(r) for r in rows]
 
     def branch_info(self, msg_id: int) -> tuple[int, int]:
         """(position, total) among siblings, 1-based -- e.g. '2/3' in the UI."""

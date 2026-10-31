@@ -1,7 +1,7 @@
 import { els, state } from "./state.js";
 import { api } from "./api.js";
-import { closeSidebar, toast } from "./ui.js";
-import { renderMessages } from "./messages.js";
+import { closeSidebar, setPendingInteraction, toast } from "./ui.js";
+import { renderMessages, renderPendingInteraction } from "./messages.js";
 import { stopGeneration } from "./chat.js";
 
 const idOf = (c) => c.id ?? c.conversation_id;
@@ -49,6 +49,7 @@ export function renderConversationList() {
 function resetView() {
   state.conversationId = null;
   state.messages = [];
+  setPendingInteraction(null);
   renderMessages([]);
   els.topbarTitle.textContent = "New conversation";
   renderConversationList();
@@ -75,6 +76,8 @@ export async function openConversation(id) {
     }
     els.topbarTitle.textContent = titleOf(conv);
     renderMessages(data.messages || []);
+    if (data.pending) renderPendingInteraction(data.pending);
+    else setPendingInteraction(null);
     renderConversationList();
     closeSidebar();
   } catch (error) { toast(`Couldn't open conversation: ${error.message}`, "error"); }

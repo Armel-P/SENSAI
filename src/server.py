@@ -1,3 +1,8 @@
+"""FastAPI server: a thin HTTP layer over the same core the CLI uses.
+
+REST for conversations / branches / profile, and Server-Sent Events (SSE) for streaming.
+SSE events: started | thinking | token | finished | error     (data = JSON)
+"""
 import argparse
 import json
 from pathlib import Path
@@ -11,7 +16,8 @@ from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from src.core.chat import ChatService, Compressed, Finished, Started
+from src.core.chat import (ChatService, Compressed, Finished, Interaction, Started,
+                           ToolResult, ToolStart)
 from src.core.config import load_config
 from src.core.ollama_client import (OllamaError, Thinking, Token, list_models,
                                     stream_chat)
@@ -36,6 +42,11 @@ class SettingsBody(BaseModel):
     num_ctx: Optional[int] = None
     token_budget: Optional[int] = None
     keep_recent: Optional[int] = None
+
+class AnswerBody(BaseModel):
+    value: Optional[str] = None
+    approved: Optional[bool] = None
+    cancelled: bool = False
 
 class PromptBody(BaseModel):
     title: str = Field(min_length=1, max_length=60)
@@ -80,6 +91,12 @@ async def _stream(gen):
                 yield sse("compressed", {"messages": ev.messages, "source_tokens": ev.source_tokens,
                                          "summary_tokens": ev.summary_tokens,
                                          "freed": ev.source_tokens - ev.summary_tokens})
+            elif isinstance(ev, ToolStart):
+                yield sse("tool_call", {"name": ev.name, "arguments": ev.arguments})
+            elif isinstance(ev, ToolResult):
+                yield sse("tool_result", {"name": ev.name, "result": ev.result, "status": ev.status})
+            elif isinstance(ev, Interaction):
+                yield sse("interaction", {"id": ev.id, **ev.payload})
             elif isinstance(ev, Finished):
                 yield sse("finished", {
                     "assistant_message_id": ev.assistant_message_id,
@@ -90,6 +107,11 @@ async def _stream(gen):
         yield sse("error", {"kind": type(e).__name__, "message": str(e)})
     finally:
         gen.close()
+
+
+def sse_response(gen) -> StreamingResponse:
+    return StreamingResponse(_stream(gen), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 def create_app(cfg: Optional[dict] = None, storage: Optional[Storage] = None,
@@ -110,13 +132,16 @@ def create_app(cfg: Optional[dict] = None, storage: Optional[Storage] = None,
         messages = storage.get_path(conv_id)
         for m in messages:
             m["siblings"] = [s["id"] for s in storage.get_siblings(m["id"])]
+        pending = storage.pending_for(conv_id)
         return {"conversation": conv, "messages": messages,
+                "pending": {"id": pending[0]["id"], **pending[0]["interaction"]} if pending else None,
                 "usage": {**storage.token_usage(conv_id), "num_ctx": chat.settings()["num_ctx"],
                           "summary": storage.summary_info(conv_id)}}
 
     @app.get("/api/config")
     def get_config():
-        return {"model": cfg["model"], **chat.settings()}
+        return {"model": cfg["model"], "tools_enabled": bool(cfg.get("tools", False)),
+                "tools": chat.tools.names(), **chat.settings()}
 
     @app.get("/api/settings")
     def get_settings():
@@ -190,9 +215,7 @@ def create_app(cfg: Optional[dict] = None, storage: Optional[Storage] = None,
                 raise HTTPException(422, "Only user messages can be edited")
         gen = chat.send(conv_id, body.content, edit_message_id=body.edit_message_id,
                         model=body.model, think=body.think)
-        return StreamingResponse(_stream(gen), media_type="text/event-stream",
-                                 headers={"Cache-Control": "no-cache",
-                                          "X-Accel-Buffering": "no"})
+        return sse_response(gen)
 
     @app.post("/api/conversations/{conv_id}/fork", status_code=201)
     def fork_conversation(conv_id: int, body: ForkBody = ForkBody()):
@@ -202,6 +225,27 @@ def create_app(cfg: Optional[dict] = None, storage: Optional[Storage] = None,
         except ValueError as e:
             raise HTTPException(422, str(e))
         return detail(new_id)
+
+    @app.post("/api/interactions/{pending_id}/answer")
+    def answer_interaction(pending_id: int, body: AnswerBody):
+        pending = storage.get_pending(pending_id)
+        if pending is None:
+            raise HTTPException(404, f"Interaction {pending_id} not found (already answered?)")
+        kind = pending["interaction"]["kind"]
+        if not body.cancelled:
+            if kind == "ask" and not (body.value or "").strip():
+                raise HTTPException(422, "An answer is required")
+            if kind == "confirm" and body.approved is None:
+                raise HTTPException(422, "approved must be true or false")
+        return sse_response(chat.resume(pending_id, body.model_dump(exclude_none=True)))
+
+    @app.post("/api/interactions/{pending_id}/abort")
+    def abort_interaction(pending_id: int):
+        pending = storage.get_pending(pending_id)
+        if pending is None:
+            raise HTTPException(404, f"Interaction {pending_id} not found")
+        chat.abort_pending(pending_id)
+        return detail(pending["conversation_id"])
 
     @app.post("/api/messages/{msg_id}/switch")
     def switch_branch(msg_id: int):
@@ -260,7 +304,7 @@ def create_app(cfg: Optional[dict] = None, storage: Optional[Storage] = None,
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Sensai web server")
-    ap.add_argument("--config", default="config.yaml")
+    ap.add_argument("--config", default="config.yml")
     ap.add_argument("--host")
     ap.add_argument("--port", type=int)
     args = ap.parse_args()

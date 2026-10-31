@@ -1,10 +1,10 @@
 import { $, els, state } from "./state.js";
 import { api } from "./api.js";
 import { attachCopyButtons, renderMarkdown } from "./markdown.js";
-import { escapeHTML, scrollToBottom, toast } from "./ui.js";
+import { escapeHTML, scrollToBottom, setPendingInteraction, toast } from "./ui.js";
 import { updateMeter } from "./meter.js";
 import { forkConversation, renderConversationList } from "./conversations.js";
-import { regenerateFrom, sendMessage } from "./chat.js";
+import { answerInteraction, regenerateFrom, sendMessage } from "./chat.js";
 
 const ACTIONS = '<button type="button" data-action="copy">Copy</button>' +
                 '<button type="button" data-action="regenerate">Regenerate</button>';
@@ -48,6 +48,91 @@ export function renderMessages(messages) {
   els.messages.replaceChildren(...state.messages.map(makeMessageNode));
   els.welcome.classList.toggle("hidden", state.messages.length > 0);
   updateMeter();
+  scrollToBottom();
+}
+
+export function renderPendingInteraction(interaction) {
+  setPendingInteraction(interaction);
+  const node = document.createElement("article");
+  node.className = "message assistant interaction-message";
+  const avatar = document.createElement("div");
+  avatar.className = "message-avatar";
+  avatar.textContent = "✳";
+  const main = document.createElement("div");
+  main.className = "message-main";
+  const heading = document.createElement("div");
+  heading.className = "message-heading";
+  heading.textContent = interaction.kind === "confirm" ? "Approval needed" : "Sensai needs your input";
+  const question = document.createElement("p");
+  question.className = "interaction-question";
+  question.textContent = interaction.question || "Please provide a response to continue.";
+  const form = document.createElement("form");
+  form.className = "interaction-form";
+
+  if (interaction.kind === "ask") {
+    for (const option of Array.isArray(interaction.options) ? interaction.options : []) {
+      const choice = document.createElement("button");
+      choice.type = "button";
+      choice.className = "secondary-btn interaction-option";
+      choice.textContent = option;
+      choice.addEventListener("click", () => submit({ value: option }));
+      form.append(choice);
+    }
+    const answer = document.createElement("textarea");
+    answer.className = "text-field interaction-answer";
+    answer.rows = 2;
+    answer.placeholder = "Type your answer…";
+    answer.setAttribute("aria-label", "Your answer");
+    form.append(answer);
+    const actions = document.createElement("div");
+    actions.className = "interaction-actions";
+    const skip = document.createElement("button");
+    skip.type = "button";
+    skip.className = "secondary-btn";
+    skip.textContent = "Skip";
+    skip.addEventListener("click", () => submit({ cancelled: true }));
+    const send = document.createElement("button");
+    send.type = "submit";
+    send.className = "primary-btn";
+    send.textContent = "Send answer";
+    actions.append(skip, send);
+    form.append(actions);
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      if (answer.value.trim()) submit({ value: answer.value.trim() });
+      else { answer.focus(); toast("Please enter an answer.", "error"); }
+    });
+  } else {
+    const description = document.createElement("p");
+    description.className = "interaction-description";
+    description.textContent = interaction.description || "";
+    form.append(description);
+    const actions = document.createElement("div");
+    actions.className = "interaction-actions";
+    const decline = document.createElement("button");
+    decline.type = "button";
+    decline.className = "secondary-btn";
+    decline.textContent = "Decline";
+    decline.addEventListener("click", () => submit({ approved: false }));
+    const approve = document.createElement("button");
+    approve.type = "button";
+    approve.className = "primary-btn";
+    approve.textContent = "Approve";
+    approve.addEventListener("click", () => submit({ approved: true }));
+    actions.append(decline, approve);
+    form.append(actions);
+  }
+
+  function submit(answer) {
+    if ([...form.querySelectorAll("button, textarea")].some(control => control.disabled)) return;
+    for (const control of form.querySelectorAll("button, textarea")) control.disabled = true;
+    answerInteraction(interaction, answer, node);
+  }
+
+  main.append(heading, question, form);
+  node.append(avatar, main);
+  els.messages.append(node);
+  els.welcome.classList.add("hidden");
   scrollToBottom();
 }
 
@@ -101,9 +186,19 @@ export function finishLiveAssistant(meta = {}, note = "") {
   if (!live) return;
   paint();
   const { node, text, thinking } = live;
+  if (meta.waiting && !text.trim() && !thinking.trim()) {
+    node.remove();
+    live = null;
+    return;
+  }
   const content = $(".message-content", node);
   if (note) { content.insertAdjacentHTML("beforeend", `<p><em>${escapeHTML(note)}</em></p>`); }
-  else if (!text.trim() && !thinking.trim()) content.innerHTML = "<p><em>No response was received.</em></p>";
+  else if (!meta.waiting && !text.trim() && !thinking.trim()) content.innerHTML = "<p><em>No response was received.</em></p>";
+  if (meta.waiting) {
+    $(".message-actions", node).remove();
+    live = null;
+    return;
+  }
   const bits = [];
   if (meta.gen_tokens != null) bits.push(`${meta.gen_tokens} tokens`);
   if (meta.duration_s > 0) bits.push(`${Number(meta.duration_s).toFixed(1)}s`);

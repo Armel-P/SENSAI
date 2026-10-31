@@ -6,12 +6,13 @@ export const state = {
   model: "", defaultModel: "", models: [],
   profile: { name: "", preferences: [], instructions: "" },
   controller: null, isStreaming: false, pendingDeleteId: null,
+  pendingInteraction: null,
   numCtx: 8192, budget: 0, contextWarned: false,   // context meter (M2)
 };
 
 const IDS = [
   "sidebar", "conversationList", "newChat", "topbarTitle", "modelSelect", "chatScroll", "welcome",
-  "messages", "streamStatus", "streamStatusText", "composerForm", "messageInput", "sendBtn", "stopBtn",
+  "messages", "streamStatus", "streamStatusText", "composerForm", "composerHint", "messageInput", "sendBtn", "stopBtn",
   "thinkToggle", "statusDot", "statusText", "toastRegion", "profileModal", "profileForm", "profileName",
   "profilePreferences", "profileInstructions", "profileSaveStatus", "saveProfile", "confirmModal",
   "confirmTitle", "confirmText", "confirmDelete", "contextMeter", "contextText", "contextFill",

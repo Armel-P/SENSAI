@@ -8,3 +8,6 @@ host: 127.0.0.1
 port: 8000
 token_budget: 6000
 keep_recent: 4
+tools: true
+max_tool_rounds: 6
+notes_path: data/notes.md

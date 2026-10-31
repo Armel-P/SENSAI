@@ -1,3 +1,4 @@
+"""Thin wrapper over the Ollama HTTP API (no LLM framework)."""
 import json
 from dataclasses import dataclass
 from typing import Iterator, Optional, Union
@@ -24,6 +25,11 @@ class Thinking:
     text: str
 
 @dataclass
+class ToolCall:
+    name: str
+    arguments: dict
+
+@dataclass
 class Done:
     prompt_tokens: int
     gen_tokens: int
@@ -31,12 +37,14 @@ class Done:
 
 
 def stream_chat(url: str, model: str, messages: list[dict],
-                num_ctx: int = 8192, think: Optional[bool] = None
-                ) -> Iterator[Union[Thinking, Token, Done]]:
+                num_ctx: int = 8192, think: Optional[bool] = None,
+                tools: Optional[list] = None) -> Iterator[Union[Thinking, Token, ToolCall, Done]]:
     payload = {"model": model, "messages": messages, "stream": True,
                "options": {"num_ctx": num_ctx}}
     if think is not None:
         payload["think"] = think
+    if tools:
+        payload["tools"] = tools
     try:
         r = requests.post(
             f"{url}/api/chat",
@@ -50,6 +58,14 @@ def stream_chat(url: str, model: str, messages: list[dict],
     except requests.Timeout as e:
         raise OllamaError("Ollama took too long to respond.") from e
 
+    if r.status_code == 400 and "think" in payload and "think" in r.text.lower():
+        r.close()
+        yield from stream_chat(url, model, messages, num_ctx, None, tools)
+        return
+    if r.status_code == 400 and tools and "tool" in r.text.lower():
+        r.close()
+        yield from stream_chat(url, model, messages, num_ctx, think, None)
+        return
     if r.status_code == 404:
         raise ModelNotFound(f"Model '{model}' not found. Run: ollama pull {model}")
     if not r.ok:
@@ -68,6 +84,15 @@ def stream_chat(url: str, model: str, messages: list[dict],
             content = msg.get("content", "")
             if content:
                 yield Token(content)
+            for call in msg.get("tool_calls") or []:
+                fn = call.get("function", {})
+                args = fn.get("arguments") or {}
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except ValueError:
+                        args = {}
+                yield ToolCall(fn.get("name", ""), args)
             if chunk.get("done"):
                 yield Done(
                     prompt_tokens=chunk.get("prompt_eval_count", 0),

@@ -1,13 +1,35 @@
 import argparse
+import json
 import sys
 
-from src.core.chat import ChatService, Compressed, Finished, Started
+from src.core.chat import (ChatService, Compressed, Finished, Interaction, Started,
+                           ToolResult, ToolStart)
 from src.core.config import load_config
 from src.core.ollama_client import OllamaError, Thinking, Token
 from src.core.storage import Storage
 
 DIM, RESET = "\033[2m", "\033[0m"
 HELP = ("Commands: /list  /new  /resume <id>  /history  /title <text>  /budget [n|off]  /ctx [n]  /help  /quit")
+
+
+def ask_in_terminal(payload: dict) -> dict:
+    """X4 / A3 in the terminal: answer the model's question, or approve / reject an action."""
+    print(f"\n\n? {payload['question']}")
+    if payload["kind"] == "confirm":
+        print(f"  {payload['tool']}({json.dumps(payload['arguments'], ensure_ascii=False)})")
+        try:
+            return {"approved": input("  Approve? [y/N] ").strip().lower() in ("y", "yes")}
+        except (EOFError, KeyboardInterrupt):
+            return {"cancelled": True}
+    for i, option in enumerate(payload["options"], 1):
+        print(f"  {i}) {option}")
+    try:
+        value = input("  > ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return {"cancelled": True}
+    if value.isdigit() and 1 <= int(value) <= len(payload["options"]):
+        value = payload["options"][int(value) - 1]
+    return {"value": value} if value else {"cancelled": True}
 
 
 def show_history(storage, conv_id):
@@ -22,7 +44,7 @@ def show_history(storage, conv_id):
 def main() -> int:
     ap = argparse.ArgumentParser(description="Sensai CLI chatbot")
     ap.add_argument("--model", help="override the model from config.yaml")
-    ap.add_argument("--config", default="config.yaml")
+    ap.add_argument("--config", default="config.yml")
     ap.add_argument("--resume", type=int, metavar="ID", help="resume a conversation")
     ap.add_argument("--last", action="store_true", help="resume the most recent conversation")
     ap.add_argument("--think", action="store_true", help="enable thinking mode and show it")
@@ -97,22 +119,31 @@ def main() -> int:
             conv_id = storage.create_conversation(model=args.model or cfg["model"])
         was_thinking = False
         print("sensai> ", end="", flush=True)
+        events = chat.send(conv_id, user, model=args.model, think=think)
         try:
-            for ev in chat.send(conv_id, user, model=args.model, think=think):
-                if isinstance(ev, Thinking):
-                    was_thinking = True
-                    print(f"{DIM}{ev.text}{RESET}", end="", flush=True)
-                elif isinstance(ev, Token):
-                    if was_thinking:
-                        print("\n", end="")
-                        was_thinking = False
-                    print(ev.text, end="", flush=True)
-                elif isinstance(ev, Compressed):
-                    print(f"\n[condensed {ev.messages} older messages: ~{ev.source_tokens} -> "
-                          f"{ev.summary_tokens} tokens]\nsensai> ", end="", flush=True)
-                elif isinstance(ev, Finished):
-                    print(f"\n[{ev.prompt_tokens} prompt + {ev.gen_tokens} gen tokens, "
-                          f"{ev.duration_s:.1f}s]")
+            while events is not None:
+                resumed, events = events, None
+                for ev in resumed:
+                    if isinstance(ev, Thinking):
+                        was_thinking = True
+                        print(f"{DIM}{ev.text}{RESET}", end="", flush=True)
+                    elif isinstance(ev, Token):
+                        if was_thinking:
+                            print("\n", end="")
+                            was_thinking = False
+                        print(ev.text, end="", flush=True)
+                    elif isinstance(ev, Compressed):
+                        print(f"\n[condensed {ev.messages} older messages: ~{ev.source_tokens} -> "
+                              f"{ev.summary_tokens} tokens]\nsensai> ", end="", flush=True)
+                    elif isinstance(ev, ToolStart):
+                        print(f"\n{DIM}[tool] {ev.name}({json.dumps(ev.arguments, ensure_ascii=False)}){RESET}", end="", flush=True)
+                    elif isinstance(ev, ToolResult):
+                        print(f"\n{DIM}[tool] -> {ev.result[:200]} ({ev.status}){RESET}\nsensai> ", end="", flush=True)
+                    elif isinstance(ev, Interaction):
+                        events = chat.resume(ev.id, ask_in_terminal(ev.payload))
+                    elif isinstance(ev, Finished):
+                        print(f"\n[{ev.prompt_tokens} prompt + {ev.gen_tokens} gen tokens, "
+                              f"{ev.duration_s:.1f}s]")
         except KeyboardInterrupt:
             print("\n[interrupted]")
         except OllamaError as e:
