@@ -7,12 +7,12 @@ DEFAULTS = {
     "num_ctx": 8192,
     "system_prompt": "You are a helpful assistant.",
     "db_path": "sensai.db",
-    "profile_path": "profiles/user.yml",
+    "profile_path": "profiles/user.yaml",
     "host": "127.0.0.1",
     "port": 8000
 }
 
-def load_config(path: str = "config.yml") -> dict:
+def load_config(path: str = "config.yaml") -> dict:
     cfg = dict(DEFAULTS)
     p = Path(path)
     if p.exists():

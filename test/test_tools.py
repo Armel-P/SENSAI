@@ -43,6 +43,7 @@ def test_tool_loop_calls_a_tool_and_continues(tmp_path):
     events = list(svc.send(cid, "what is 2+3*4?"))
     assert kinds(events) == ["Started", "ToolStart", "ToolResult", "Token", "Finished"]
     assert [t["function"]["name"] for t in seen[0]["tools"]] == ["get_current_time", "calculate", "ask_user", "save_note"]
+    # the 2nd model call saw the assistant tool call and the tool result
     roles = [m["role"] for m in seen[1]["messages"]]
     assert roles == ["system", "user", "assistant", "tool"]
     assert seen[1]["messages"][2]["tool_calls"][0]["function"]["name"] == "calculate"
@@ -97,7 +98,7 @@ def test_ask_user_suspends_then_resumes_with_the_answer(tmp_path):
     assert resumed[0].result == "Tokyo" and resumed[0].status == "answered"
     assert seen[1]["messages"][-1] == {"role": "tool", "tool_name": "ask_user", "content": "Tokyo"}
     assert st.get_path(cid)[-1]["content"] == "Tokyo it is." and st.pending_for(cid) == []
-    with pytest.raises(KeyError):                                       # at most once
+    with pytest.raises(KeyError):
         list(svc.resume(ask.id, {"value": "again"}))
 
 
@@ -140,7 +141,7 @@ def test_new_message_abandons_a_suspended_turn(tmp_path):
     assert [m["role"] for m in path] == ["user", "assistant", "user", "assistant"]
     assert path[1]["interrupted"] == 1 and path[1]["tool_trace"][0]["calls"][0]["status"] == "waiting"
     assert st.pending_for(cid) == []
-    assert seen[1]["messages"][2]["role"] == "assistant"                 # replayed, tool result flagged
+    assert seen[1]["messages"][2]["role"] == "assistant"
     assert any("no result" in m["content"] for m in seen[1]["messages"] if m["role"] == "tool")
 
 
@@ -218,14 +219,14 @@ def test_api_tool_events_ask_answer_and_abort(tmp_path):
     assert [e for e, _ in ev] == ["started", "tool_call", "interaction"]
     question = ev[-1][1]
     assert question["kind"] == "ask" and question["options"] == ["red", "blue"]
-    assert client.get(f"/api/conversations/{cid}").json()["pending"]["id"] == question["id"]   # UI can restore it
+    assert client.get(f"/api/conversations/{cid}").json()["pending"]["id"] == question["id"]
 
     url = f"/api/interactions/{question['id']}/answer"
     assert client.post(url, json={}).status_code == 422
     assert client.post("/api/interactions/999/answer", json={"value": "x"}).status_code == 404
     ev = sse(client.post(url, json={"value": "blue"}).text)
     assert [e for e, _ in ev] == ["tool_result", "token", "finished"] and ev[0][1]["status"] == "answered"
-    assert client.post(url, json={"value": "blue"}).status_code == 404                           # already answered
+    assert client.post(url, json={"value": "blue"}).status_code == 404
 
     ev = sse(client.post(f"/api/conversations/{cid}/messages", json={"content": "again"}).text)
     pid = ev[-1][1]["id"]

@@ -21,6 +21,9 @@ from src.core.chat import (ChatService, Compressed, Finished, Interaction, Start
 from src.core.config import load_config
 from src.core.ollama_client import (OllamaError, Thinking, Token, list_models,
                                     stream_chat)
+from src.core.sandbox import make_extra_tools
+from src.core.orchestrator import Evt, Orchestrator, ProjectError, list_files
+from src.core.workspace import FilePolicy, PermissionDenied
 from src.core.export import export_json, export_markdown, slug
 from src.core.profile import load_profile
 from src.core.storage import Storage
@@ -48,6 +51,15 @@ class AnswerBody(BaseModel):
     approved: Optional[bool] = None
     cancelled: bool = False
 
+class ProjectBody(BaseModel):
+    goal: str = Field(min_length=3, max_length=4000)
+    title: Optional[str] = Field(None, max_length=100)
+    team: Optional[list[str]] = None
+    workspace: Optional[str] = None
+
+class ApproveBody(BaseModel):
+    plan: Optional[dict] = None
+
 class PromptBody(BaseModel):
     title: str = Field(min_length=1, max_length=60)
     content: str = Field(min_length=1, max_length=4000)
@@ -56,8 +68,9 @@ class ForkBody(BaseModel):
     from_message_id: Optional[int] = None
     title: Optional[str] = None
 
-class RenameBody(BaseModel):
-    title: str = Field(min_length=1, max_length=100)
+class PatchBody(BaseModel):
+    title: Optional[str] = Field(None, min_length=1, max_length=100)
+    persona: Optional[str] = None
 
 class ProfileBody(BaseModel):
     name: Optional[str] = None
@@ -81,6 +94,9 @@ async def _stream(gen):
             ev = await run_in_threadpool(next, gen, _END)
             if ev is _END:
                 break
+            if isinstance(ev, Evt):
+                yield sse(ev.name, ev.data)
+                continue
             if isinstance(ev, Started):
                 yield sse("started", {"user_message_id": ev.user_message_id})
             elif isinstance(ev, Thinking):
@@ -119,6 +135,8 @@ def create_app(cfg: Optional[dict] = None, storage: Optional[Storage] = None,
     cfg = cfg or load_config()
     storage = storage or Storage(cfg["db_path"])
     chat = ChatService(storage, cfg, stream_fn)
+    orch = Orchestrator(storage, cfg, stream_fn, extra_tools=make_extra_tools(cfg))
+    storage.reset_running_projects()          # nothing can still be running after a restart
     app = FastAPI(title="Sensai")
 
     def conv_or_404(conv_id: int) -> dict:
@@ -175,10 +193,24 @@ def create_app(cfg: Optional[dict] = None, storage: Optional[Storage] = None,
         return detail(conv_id)
 
     @app.patch("/api/conversations/{conv_id}")
-    def rename_conversation(conv_id: int, body: RenameBody):
+    def patch_conversation(conv_id: int, body: PatchBody):
+        """Rename and/or switch persona. Switching keeps the whole history (A5)."""
         conv_or_404(conv_id)
-        storage.update_conversation(conv_id, title=body.title)
+        changes = {}
+        if body.title is not None:
+            changes["title"] = body.title
+        if "persona" in body.model_fields_set:
+            if body.persona and chat.personas.get(body.persona) is None:
+                raise HTTPException(422, f"Unknown persona '{body.persona}'")
+            changes["persona"] = body.persona or None
+        if not changes:
+            raise HTTPException(422, "Nothing to update")
+        storage.update_conversation(conv_id, **changes)
         return storage.get_conversation(conv_id)
+
+    @app.get("/api/personas")
+    def list_personas():
+        return [p.summary() for p in chat.personas.list()]
 
     @app.delete("/api/conversations/{conv_id}")
     def delete_conversation(conv_id: int):
@@ -225,6 +257,79 @@ def create_app(cfg: Optional[dict] = None, storage: Optional[Storage] = None,
         except ValueError as e:
             raise HTTPException(422, str(e))
         return detail(new_id)
+
+    def project_or_404(project_id: int) -> dict:
+        project = storage.get_project(project_id)
+        if project is None:
+            raise HTTPException(404, f"Project {project_id} not found")
+        return project
+
+    @app.post("/api/projects")
+    def create_project(body: ProjectBody):
+        """Create a project and stream the PM's plan. The stream ends with a `plan` event:
+        nothing is executed until the user approves it."""
+        try:
+            pid = orch.create_project(body.goal, body.team, body.workspace, body.title)
+        except ProjectError as e:
+            raise HTTPException(e.status, str(e))
+        return sse_response(orch.plan(pid))
+
+    @app.get("/api/projects")
+    def list_projects():
+        out = []
+        for p in storage.list_projects():
+            tasks = storage.list_tasks(p["id"])
+            out.append({**p, "tasks_total": len(tasks), "tasks_done": sum(t["status"] == "done" for t in tasks)})
+        return out
+
+    @app.get("/api/projects/{project_id}")
+    def get_project(project_id: int):
+        return {"project": project_or_404(project_id), "tasks": storage.list_tasks(project_id)}
+
+    @app.post("/api/projects/{project_id}/approve")
+    def approve_project(project_id: int, body: ApproveBody = ApproveBody()):
+        """Approve (optionally an edited) plan and stream the agents working. Also resumes a
+        paused / failed project: tasks already done are not redone."""
+        try:
+            orch.check_runnable(project_id, body.plan)
+        except ProjectError as e:
+            raise HTTPException(e.status, str(e))
+        return sse_response(orch.run(project_id, body.plan))
+
+    @app.post("/api/projects/{project_id}/cancel")
+    def cancel_project(project_id: int):
+        project_or_404(project_id)
+        if not storage.claim_project(project_id, ("running", "planning", "awaiting_approval", "paused", "failed"), "cancelled"):
+            raise HTTPException(409, "This project is already finished")
+        return storage.get_project(project_id)
+
+    @app.delete("/api/projects/{project_id}")
+    def delete_project(project_id: int):
+        if project_or_404(project_id)["status"] == "running":
+            raise HTTPException(409, "Cancel the project first")
+        storage.delete_project(project_id)
+        return {"deleted": project_id}
+
+    @app.get("/api/projects/{project_id}/files")
+    def project_files(project_id: int):
+        return {"files": list_files(orch.workspace(project_or_404(project_id)), limit=500)}
+
+    @app.get("/api/projects/{project_id}/files/{path:path}")
+    def project_file(project_id: int, path: str):
+        ws = orch.workspace(project_or_404(project_id))
+        try:
+            target, rel = ws.resolve(path)
+            FilePolicy().check("read", rel)
+        except PermissionDenied as e:
+            raise HTTPException(403, str(e))
+        if not target.is_file():
+            raise HTTPException(404, f"No such file: {rel}")
+        if target.stat().st_size > ws.max_bytes:
+            raise HTTPException(413, "File too large to display")
+        try:
+            return {"path": rel, "content": target.read_text(encoding="utf-8")}
+        except UnicodeDecodeError:
+            raise HTTPException(415, "Not a text file")
 
     @app.post("/api/interactions/{pending_id}/answer")
     def answer_interaction(pending_id: int, body: AnswerBody):
@@ -304,7 +409,7 @@ def create_app(cfg: Optional[dict] = None, storage: Optional[Storage] = None,
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Sensai web server")
-    ap.add_argument("--config", default="config.yml")
+    ap.add_argument("--config", default="config.yaml")
     ap.add_argument("--host")
     ap.add_argument("--port", type=int)
     args = ap.parse_args()

@@ -44,7 +44,7 @@ def show_history(storage, conv_id):
 def main() -> int:
     ap = argparse.ArgumentParser(description="Sensai CLI chatbot")
     ap.add_argument("--model", help="override the model from config.yaml")
-    ap.add_argument("--config", default="config.yml")
+    ap.add_argument("--config", default="config.yaml")
     ap.add_argument("--resume", type=int, metavar="ID", help="resume a conversation")
     ap.add_argument("--last", action="store_true", help="resume the most recent conversation")
     ap.add_argument("--think", action="store_true", help="enable thinking mode and show it")

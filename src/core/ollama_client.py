@@ -38,13 +38,16 @@ class Done:
 
 def stream_chat(url: str, model: str, messages: list[dict],
                 num_ctx: int = 8192, think: Optional[bool] = None,
-                tools: Optional[list] = None) -> Iterator[Union[Thinking, Token, ToolCall, Done]]:
+                tools: Optional[list] = None, format_schema: Optional[dict] = None
+                ) -> Iterator[Union[Thinking, Token, ToolCall, Done]]:
     payload = {"model": model, "messages": messages, "stream": True,
                "options": {"num_ctx": num_ctx}}
     if think is not None:
         payload["think"] = think
     if tools:
         payload["tools"] = tools
+    if format_schema:
+        payload["format"] = format_schema
     try:
         r = requests.post(
             f"{url}/api/chat",
@@ -59,12 +62,12 @@ def stream_chat(url: str, model: str, messages: list[dict],
         raise OllamaError("Ollama took too long to respond.") from e
 
     if r.status_code == 400 and "think" in payload and "think" in r.text.lower():
-        r.close()
-        yield from stream_chat(url, model, messages, num_ctx, None, tools)
+        r.close()  # this model has no thinking mode: retry once without the option
+        yield from stream_chat(url, model, messages, num_ctx, None, tools, format_schema)
         return
     if r.status_code == 400 and tools and "tool" in r.text.lower():
-        r.close()
-        yield from stream_chat(url, model, messages, num_ctx, think, None)
+        r.close()  # this model cannot call tools: answer without them
+        yield from stream_chat(url, model, messages, num_ctx, think, None, format_schema)
         return
     if r.status_code == 404:
         raise ModelNotFound(f"Model '{model}' not found. Run: ollama pull {model}")

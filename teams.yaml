@@ -1,0 +1,2 @@
+# Which agents take part in this project. The PM only plans with the agents listed here.
+active: [pm, backend, frontend, tester, reviewer]

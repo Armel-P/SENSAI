@@ -1,0 +1,24 @@
+ollama_url: http://localhost:11434
+model: qwen3:8b
+num_ctx: 8192
+system_prompt: "You are Sensai, a helpful and concise assistant."
+db_path: sensai.db
+profile_path: profiles/user.yaml
+host: 127.0.0.1
+port: 8000
+token_budget: 6000
+keep_recent: 4
+tools: false
+max_tool_rounds: 6
+notes_path: data/notes.md
+personas_dir: personas
+workspaces_dir: workspaces
+team_path: team.yaml
+max_plan_tasks: 8
+plan_retries: 2
+task_retries: 1
+agent_think: false
+sandbox_timeout_s: 20
+sandbox_memory_mb: 768
+sandbox_output_chars: 1800
+agent_tool_rounds: 12

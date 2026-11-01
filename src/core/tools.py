@@ -35,11 +35,11 @@ class ToolRegistry:
     def names(self) -> list[str]:
         return list(self._tools)
 
-    def schemas(self) -> list[dict]:
-        """The `tools` array of Ollama's /api/chat."""
+    def schemas(self, names: Optional[list] = None) -> list[dict]:
+        """The `tools` array of Ollama's /api/chat (optionally only these tool names)."""
         return [{"type": "function", "function": {"name": t.name, "description": t.description,
                                                   "parameters": t.parameters}}
-                for t in self._tools.values()]
+                for t in self._tools.values() if names is None or t.name in names]
 
 
 _OPS = {ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul,
@@ -64,7 +64,7 @@ def calculate(args: dict) -> str:
     expression = str(args.get("expression", "")).strip()
     if not expression or len(expression) > 200:
         raise ValueError("expression is empty or too long")
-    return str(_eval(ast.parse(expression, mode="eval").body))   # never uses eval()
+    return str(_eval(ast.parse(expression, mode="eval").body))
 
 
 def get_current_time(args: dict) -> str:

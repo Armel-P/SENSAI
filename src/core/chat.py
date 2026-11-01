@@ -10,6 +10,7 @@ from typing import Callable, Iterator, Optional, Union
 
 from .budget import (effective_budget, estimate_tokens, resolve_settings,
                      validate_settings)
+from .personas import PersonaStore
 from .ollama_client import Done, OllamaError, Thinking, Token, ToolCall, stream_chat
 from .profile import load_profile, profile_to_prompt
 from .storage import Storage
@@ -69,6 +70,7 @@ class ChatService:
         self.cfg = cfg
         self.stream_fn = stream_fn
         self.tools = tools or builtin_registry(cfg.get("notes_path", "data/notes.md"))
+        self.personas = PersonaStore(cfg.get("personas_dir", "personas"))
 
     def settings(self) -> dict:
         s = resolve_settings(self.cfg, self.storage.all_settings())
@@ -80,9 +82,13 @@ class ChatService:
             self.storage.set_setting(key, value)
         return self.settings()
 
-    def system_prompt(self) -> str:
+    def _persona(self, conv: Optional[dict]):
+        return self.personas.get(conv.get("persona")) if conv else None
+
+    def system_prompt(self, persona=None) -> str:
+        # Profile and persona files are re-read on every turn: editing them applies immediately.
         extra = profile_to_prompt(load_profile(self.cfg["profile_path"]))
-        base = self.cfg["system_prompt"]
+        base = persona.system_prompt if persona else self.cfg["system_prompt"]
         return f"{base}\n\n{extra}" if extra else base
 
     @staticmethod
@@ -109,7 +115,8 @@ class ChatService:
         pending = path[start:]
         prev = summ["content"] if summ else ""
 
-        tokens = estimate_tokens(self.system_prompt() + prev) + sum(self._size(m) for m in pending)
+        persona = self._persona(self.storage.get_conversation(conv_id))
+        tokens = estimate_tokens(self.system_prompt(persona) + prev) + sum(self._size(m) for m in pending)
         last = next((m for m in reversed(path) if m["prompt_tokens"]), None)
         if last and (not summ or last["id"] > summ["upto_message_id"]):
             after = path[path.index(last) + 1:]
@@ -165,7 +172,7 @@ class ChatService:
             raise ValueError("Empty message")
         if self.storage.get_conversation(conv_id) is None:
             raise KeyError(f"Conversation {conv_id} not found")
-        for pending in self.storage.pending_for(conv_id):    # a new message abandons a suspended turn
+        for pending in self.storage.pending_for(conv_id):
             self.abort_pending(pending["id"])
         conv = self.storage.get_conversation(conv_id)
 
@@ -175,7 +182,8 @@ class ChatService:
         else:
             user_id = self.storage.add_message(conv_id, "user", content)
 
-        model = model or conv["model"] or self.cfg["model"]
+        persona = self._persona(conv)
+        model = model or (persona.model if persona else None) or conv["model"] or self.cfg["model"]
         updates = {}
         if conv["title"] == DEFAULT_TITLE and edit_message_id is None:
             updates["title"] = content[:50]
@@ -189,12 +197,13 @@ class ChatService:
             compressed = self._maybe_compress(conv_id, model, self.settings())
             if compressed:
                 yield compressed
-            context = self.storage.build_context(conv_id, self.system_prompt())
+            context = self.storage.build_context(conv_id, self.system_prompt(persona))
         except (GeneratorExit, OllamaError):
             self.storage.discard_message(user_id, prev_leaf)
             raise
         state = {"conv_id": conv_id, "user_id": user_id, "prev_leaf": prev_leaf, "model": model,
                  "think": think, "messages": context, "trace": [], "queue": [], "rounds": 0,
+                 "tool_names": persona.tools if persona else None,
                  "prompt_tokens": None, "gen_tokens": None, "duration_s": 0.0}
         yield from self._run(state)
 
@@ -217,7 +226,8 @@ class ChatService:
     def _run(self, st: dict, answer: Optional[dict] = None) -> Iterator[Event]:
         """model -> (tool calls -> results -> model)* -> final reply.
         Suspends (saves `st`, yields Interaction, returns) when a tool needs the user."""
-        schemas = self.tools.schemas() if self.cfg.get("tools", False) else []
+        names = st.get("tool_names")                    # a persona may restrict the tools
+        schemas = self.tools.schemas(names) if self.cfg.get("tools", False) else []
         extra = {"tools": schemas} if schemas else {}
         max_rounds = int(self.cfg.get("max_tool_rounds", 6))
         settings = self.settings()
@@ -263,7 +273,7 @@ class ChatService:
                 step = st["trace"][-1]
                 while st["queue"]:
                     call = step["calls"][st["queue"][0]]
-                    tool = self.tools.get(call["name"])
+                    tool = self.tools.get(call["name"]) if names is None or call["name"] in names else None
                     if call["status"] == "pending":
                         yield ToolStart(call["name"], call["arguments"])
                     if tool and (tool.ask or tool.confirm) and answer is None:
@@ -271,7 +281,7 @@ class ChatService:
                         payload = self._interaction(tool, call["arguments"])
                         yield Interaction(self.storage.save_pending(st["conv_id"], st["user_id"], st, payload),
                                           payload)
-                        return
+                        return                                        # suspended until the user answers
                     result, status = self._execute(tool, call, answer)
                     answer = None
                     call["result"], call["status"] = result, status

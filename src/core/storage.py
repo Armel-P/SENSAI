@@ -38,6 +38,36 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 CREATE INDEX IF NOT EXISTS idx_messages_parent ON messages(parent_id);
 CREATE INDEX IF NOT EXISTS idx_messages_conv   ON messages(conversation_id);
+CREATE TABLE IF NOT EXISTS projects (          -- A2: multi-agent projects
+    id         INTEGER PRIMARY KEY,
+    title      TEXT NOT NULL,
+    goal       TEXT NOT NULL,
+    status     TEXT NOT NULL,       -- planning | awaiting_approval | running | paused | done | failed | cancelled
+    team       TEXT NOT NULL,       -- JSON list of persona ids
+    workspace  TEXT NOT NULL,       -- folder name under workspaces/
+    summary    TEXT,
+    error      TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS tasks (
+    id              INTEGER PRIMARY KEY,
+    project_id      INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    position        INTEGER NOT NULL,
+    key             TEXT NOT NULL,
+    title           TEXT NOT NULL,
+    agent           TEXT NOT NULL,
+    description     TEXT NOT NULL,
+    depends_on      TEXT NOT NULL,
+    files           TEXT NOT NULL,   -- JSON: files the task must create
+    status          TEXT NOT NULL,   -- pending | running | done | failed | skipped
+    conversation_id INTEGER,
+    summary         TEXT,
+    error           TEXT,
+    written         TEXT NOT NULL DEFAULT '[]',
+    started_at      TEXT,
+    finished_at     TEXT
+);
 CREATE TABLE IF NOT EXISTS pending_turns (     -- turns suspended for A3 / X4 (survive a restart)
     id              INTEGER PRIMARY KEY,
     conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
@@ -70,6 +100,7 @@ CREATE TABLE IF NOT EXISTS facts (            -- reserved for M3
 );
 """
 
+
 DEFAULT_PROMPTS = [
     ("Get unstuck", "Help me break down a big task into small, manageable steps."),
     ("Brainstorm ideas", "Help me brainstorm a few creative ideas for a project."),
@@ -94,7 +125,7 @@ class Storage:
     def __init__(self, path: str = "sensai.db"):
         self._path = path
         self._local = threading.local()
-        self.db
+        self.db  # create the schema right away
 
     @property
     def db(self) -> sqlite3.Connection:
@@ -241,6 +272,95 @@ class Storage:
             if m["content"] or not m.get("tool_trace"):
                 out.append({"role": m["role"], "content": m["content"]})
         return out
+
+    _TASK_JSON = ("depends_on", "files", "written")
+
+    def create_project(self, title: str, goal: str, team: list, workspace: str) -> int:
+        now = _now()
+        cur = self.db.execute(
+            "INSERT INTO projects(title, goal, status, team, workspace, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?)", (title, goal, "planning", json.dumps(team), workspace, now, now))
+        self.db.commit()
+        return cur.lastrowid
+
+    @staticmethod
+    def _project(row) -> Optional[dict]:
+        if row is None:
+            return None
+        d = dict(row)
+        d["team"] = json.loads(d["team"])
+        return d
+
+    def get_project(self, project_id: int) -> Optional[dict]:
+        return self._project(self.db.execute("SELECT * FROM projects WHERE id=?", (project_id,)).fetchone())
+
+    def list_projects(self) -> list[dict]:
+        rows = self.db.execute("SELECT * FROM projects ORDER BY updated_at DESC, id DESC").fetchall()
+        return [self._project(r) for r in rows]
+
+    def update_project(self, project_id: int, **fields) -> None:
+        allowed = {"title", "status", "summary", "error", "workspace"}
+        if set(fields) - allowed:
+            raise ValueError(f"Cannot update fields: {set(fields) - allowed}")
+        sets = ", ".join(f"{k}=?" for k in fields)
+        self.db.execute(f"UPDATE projects SET {sets}, updated_at=? WHERE id=?",
+                        (*fields.values(), _now(), project_id))
+        self.db.commit()
+
+    def delete_project(self, project_id: int) -> None:
+        self.db.execute("DELETE FROM projects WHERE id=?", (project_id,))
+        self.db.commit()
+
+    def claim_project(self, project_id: int, from_statuses, to_status: str) -> bool:
+        """Atomic status change: succeeds only if the project is currently in one of from_statuses."""
+        marks = ",".join("?" * len(from_statuses))
+        cur = self.db.execute(
+            f"UPDATE projects SET status=?, updated_at=? WHERE id=? AND status IN ({marks})",
+            (to_status, _now(), project_id, *from_statuses))
+        self.db.commit()
+        return cur.rowcount == 1
+
+    def reset_running_projects(self) -> None:
+        """After a crash/restart nothing is really running: running -> paused."""
+        self.db.execute("UPDATE projects SET status='paused' WHERE status IN ('running','planning')")
+        self.db.execute("UPDATE tasks SET status='pending' WHERE status='running'")
+        self.db.commit()
+
+    def set_tasks(self, project_id: int, tasks: list[dict]) -> None:
+        self.db.execute("DELETE FROM tasks WHERE project_id=?", (project_id,))
+        for i, t in enumerate(tasks):
+            self.db.execute(
+                "INSERT INTO tasks(project_id, position, key, title, agent, description, depends_on, files, status) "
+                "VALUES (?,?,?,?,?,?,?,?,'pending')",
+                (project_id, i, t["id"], t["title"], t["agent"], t["description"],
+                 json.dumps(t.get("depends_on") or []), json.dumps(t.get("files") or [])))
+        self.db.commit()
+
+    @classmethod
+    def _task(cls, row) -> dict:
+        d = dict(row)
+        for k in cls._TASK_JSON:
+            d[k] = json.loads(d[k])
+        return d
+
+    def list_tasks(self, project_id: int) -> list[dict]:
+        return [self._task(r) for r in self.db.execute(
+            "SELECT * FROM tasks WHERE project_id=? ORDER BY position", (project_id,))]
+
+    def update_task(self, task_id: int, **fields) -> None:
+        allowed = {"status", "conversation_id", "summary", "error", "written", "started_at", "finished_at"}
+        if set(fields) - allowed:
+            raise ValueError(f"Cannot update fields: {set(fields) - allowed}")
+        values = [json.dumps(v) if k in self._TASK_JSON else v for k, v in fields.items()]
+        sets = ", ".join(f"{k}=?" for k in fields)
+        self.db.execute(f"UPDATE tasks SET {sets} WHERE id=?", (*values, task_id))
+        self.db.commit()
+
+    def reset_tasks_for_run(self, project_id: int) -> None:
+        """Before (re)running: anything not done goes back to pending."""
+        self.db.execute("UPDATE tasks SET status='pending', error=NULL WHERE project_id=? AND status!='done'",
+                        (project_id,))
+        self.db.commit()
 
     def save_pending(self, conv_id: int, user_message_id: int, state: dict, interaction: dict) -> int:
         cur = self.db.execute(
